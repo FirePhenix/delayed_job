@@ -75,8 +75,38 @@ module Delayed
             Time.now
           end
         end
+      
 
+      end
+     class PersistentJob < Job
+        set_table_name :persistent_delayed_jobs
+      end
+
+      class ElasticJob < Job
+        set_table_name :elastic_delayed_jobs
+      end
+
+      # Superficial job types
+
+      class ActivateJob < PersistentJob; end
+      class WebsiteMonitorJob < PersistentJob; end
+
+      class UtilityJob < ElasticJob; end
+      class PullJob < ElasticJob; end
+
+      # Legacy DB Backup job class
+      class DatabaseBackupJob < Job
+        set_table_name :db_backup_delayed_jobs
       end
     end
   end
+  Job = Backend::ActiveRecord::Job
+  ActivateJob = Backend::ActiveRecord::ActivateJob
+  PullJob = Backend::ActiveRecord::PullJob
+  DatabaseBackupJob = Backend::ActiveRecord::DatabaseBackupJob
+  WebsiteMonitorJob = Backend::ActiveRecord::WebsiteMonitorJob
+  UtilityJob = Backend::ActiveRecord::UtilityJob
+
+  PersistentJob = Backend::ActiveRecord::PersistentJob
+  ElasticJob = Backend::ActiveRecord::ElasticJob
 end
