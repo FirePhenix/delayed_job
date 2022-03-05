@@ -174,9 +174,74 @@ module Delayed
     # Run the next job we can get an exclusive lock on.
     # If no jobs are left we return nil
     def reserve_and_run_one_job
-      job = Delayed::Job.reserve(self)
+      job = job_class.lock_from_cache(self, max_run_time)
+      job ||= job_class.rate_limited_reserve(self, max_run_time)
       run(job) if job
     end
+  
+     def load
+      `uptime |  awk -F 'load average:' '{ print $2; }'`.split(',').map(&:to_f)
+    end
+
+    # returns 5 minute avg system load
+    def pause_load
+      load[1]
+    end
+
+    # returns 1 minute avg system load
+    def resume_load
+      load[0]
+    end
+
+    # number of cpus on system
+    def ncpu
+      @procs ||= `grep -c ^processor /proc/cpuinfo 2>/dev/null || sysctl -n hw.ncpu`.to_i
+    end
+
+    # percentage of disk space used
+    def disk_used_pcent
+      `df --output=pcent #{APP_CONFIG['data_directory']} | tail -1`.to_i
+    end
+
+    # percentage of disk space used before pausing workers
+    #
+    # Evenly distribute disk space among workers. If a worker can't get it's
+    # share (i.e. there isn't 1/worker_count of disk space available), pause
+    # the worker. Don't pause workers if disk space used is below 70%.
+    def disk_used_threshold
+      [100 - 100/worker_count, 70].max
+    end
+
+    # disk size in GiB
+    def disk_size_g
+      `df --output=size --block-size=1G #{APP_CONFIG['data_directory']} | tail -1`.to_i
+    end
+
+    # number of delayed job workers
+    def worker_count
+      `pgrep --full --count delayed_job`.to_i
+    end
+  
+  end
+  class ActivateJobWorker < Worker
+  end
+
+  class PullJobWorker < Worker
+  end
+
+  class DatabaseBackupJobWorker < Worker
+  end
+
+  class WebsiteMonitorJobWorker < Worker
+  end
+
+  class UtilityJobWorker < Worker
+  end
+
+  class PersistentJobWorker < Worker
+  end
+
+  class ElasticJobWorker < Worker
   end
 
 end
