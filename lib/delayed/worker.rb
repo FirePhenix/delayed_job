@@ -7,10 +7,11 @@ require 'logger'
 
 module Delayed
   class Worker
-    cattr_accessor :min_priority, :max_priority, :max_attempts, :max_run_time, :default_priority, :sleep_delay, :logger, :delay_jobs
+    cattr_accessor :min_priority, :max_priority, :max_attempts, :max_run_time, :default_priority, :sleep_delay, :logger, :delay_jobs, :max_lifetime
     self.sleep_delay = 5
     self.max_attempts = 25
     self.max_run_time = 4.hours
+    self.max_lifetime = 24.hours
     self.default_priority = 0
     self.delay_jobs = true
 
@@ -118,17 +119,62 @@ module Delayed
 
     def run(job)
       runtime =  Benchmark.realtime do
-        Timeout.timeout(self.class.max_run_time.to_i) { job.invoke_job }
-        job.destroy
+        job_run_at = LoggedJob.scheduled_run_at(job, job.payload_object.name)
+        job_run_at = job.created_at if job_run_at.blank? # fall back if logged job missing
+        remaining_lifetime = self.class.max_lifetime  - (Time.now - job_run_at)
+        job.payload_object.before(job) if job.payload_object.respond_to? :before
+        raise CGExceptions::JobMaxLifetimeExceeded if remaining_lifetime.to_i <= 0
+        Timeout.timeout(remaining_lifetime.to_i, CGExceptions::JobMaxLifetimeExceeded) do
+          Timeout.timeout(self.class.max_run_time.to_i, CGExceptions::JobMaxRuntimeExceeded) do
+            job.invoke_job
+          end
+        end
       end
+      job.payload_object.after(job) if job.payload_object.respond_to? :after
+      job.destroy
       say "#{job.name} completed after %.4f" % runtime
       return true  # did work
+    rescue CGExceptions::JobMaxRuntimeExceeded => error
+      # Since Timeout::timeout only allows passing in an error class,
+      # rescue the error here, and add additional information
+      error.max_runtime = self.class.max_run_time.to_i
+      say "MAXIMUM RUNTIME EXCEEDED, #{job.inspect}: #{error.inspect}", Logger::INFO
+      handle_failed_job(job, error)
+      true # always return true to avoid sleep
+    rescue CGExceptions::JobMaxLifetimeExceeded => error
+      error.max_lifetime = self.class.max_lifetime.to_i
+      say "MAXIMUM LIFETIME EXCEEDED, #{job.inspect}: #{error.inspect}", Logger::INFO
+      handle_failed_job(job, error)
+      true # always return true to avoid sleep
+    rescue CGExceptions::ListingTimeout => error
+      # Since this is not retryable, we need to handle it explicitly and not re-raise.
+      # Otherwise, the worker will get terminated.
+      job.last_error = "{#{error.message}\n#{error.backtrace.join('\n')}"
+      say "ListingTimeout Exceeded, #{job.inspect}: #{error.inspect}", Logger::INFO
+      handle_failed_job(job, error)
+      true # always return true to avoid sleep
+    rescue CGExceptions::DownloadTimeout => error
+      # Since this is not retryable, we need to handle it explicitly and not re-raise.
+      # Otherwise, the worker will get terminated.
+      job.last_error = "{#{error.message}\n#{error.backtrace.join('\n')}"
+      say "DownloadTimeout Exceeded, #{job.inspect}: #{error.inspect}", Logger::INFO
+      handle_failed_job(job, error)
+      true # always return true to avoid sleep
     rescue DeserializationError => error
       job.last_error = "{#{error.message}\n#{error.backtrace.join('\n')}"
       failed(job)
+      true # always return true to avoid sleep
     rescue Exception => error
       handle_failed_job(job, error)
-      return false  # work failed
+      if job.payload_object.respond_to? :retryable?
+        # retryable are known exceptions, unknown should raise exception, terminate process
+        # jobs with unknown exceptions are retried if attempts < max_attempts
+        unless job.payload_object.retryable?(error)
+          say "UNKNOWN ERROR, terminating process: #{error.inspect}", Logger::ERROR
+          raise error
+        end
+      end
+      true # always return true to avoid sleep
     end
 
     # Reschedule the job in the future (when a job fails).
